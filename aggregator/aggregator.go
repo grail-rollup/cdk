@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +69,7 @@ type Aggregator struct {
 
 	state        stateInterface
 	etherman     etherman
+	btcman       btcman
 	ethTxManager *ethtxmanager.Client
 	streamClient *datastreamer.StreamClient
 	l1Syncr      synchronizer.Synchronizer
@@ -106,7 +108,8 @@ func New(
 	cfg Config,
 	logger *log.Logger,
 	stateInterface stateInterface,
-	etherman etherman) (*Aggregator, error) {
+	etherman etherman,
+	btcman btcman) (*Aggregator, error) {
 	var profitabilityChecker aggregatorTxProfitabilityChecker
 
 	switch cfg.TxProfitabilityCheckerType {
@@ -180,12 +183,14 @@ func New(
 		}
 	}
 
+	log.Info("creating aggregator with btcman")
 	a := &Aggregator{
 		ctx:                     ctx,
 		cfg:                     cfg,
 		logger:                  logger,
 		state:                   stateInterface,
 		etherman:                etherman,
+		btcman:                  btcman,
 		ethTxManager:            ethTxManager,
 		streamClient:            streamClient,
 		streamClientMutex:       &sync.Mutex{},
@@ -896,6 +901,33 @@ func (a *Aggregator) sendFinalProof() {
 				FinalProof:       msg.finalProof,
 				NewLocalExitRoot: finalDBBatch.Batch.LocalExitRoot.Bytes(),
 				NewStateRoot:     finalDBBatch.Batch.StateRoot.Bytes(),
+			}
+
+			newLocalExitRoot := hex.EncodeToString(inputs.NewLocalExitRoot)
+			newStateRoot := hex.EncodeToString(inputs.NewStateRoot)
+			proofData := strings.TrimPrefix(inputs.FinalProof.Proof, "0x")
+			message := fmt.Sprintf("%s%s%s", newLocalExitRoot, newStateRoot, proofData)
+
+			log.Info("testtest")
+			log.Debugf("newLocalExitRoot: %s", newLocalExitRoot)
+			log.Debugf("newStateRoot: %s", newStateRoot)
+			log.Debugf("proof data: %s", proofData)
+			log.Debugf("message: %s", message)
+
+			messageBytes, err := hex.DecodeString(message)
+			if err != nil {
+				log.Fatalf("Can't decode message %s", err)
+			}
+
+			revealTnxHash, err := a.btcman.Inscribe(messageBytes)
+			if err != nil {
+				log.Fatalf("Can't create inscription %s", err)
+			}
+			log.Infof("Reveal tnx hash: %s", revealTnxHash)
+
+			err = a.btcman.DecodeInscription(revealTnxHash)
+			if err != nil {
+				log.Fatalf("Can't decode inscription %s", err)
 			}
 
 			switch a.cfg.SettlementBackend {

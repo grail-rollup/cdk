@@ -10,6 +10,7 @@ import (
 	"github.com/0xPolygon/cdk/aggoracle"
 	"github.com/0xPolygon/cdk/aggregator"
 	"github.com/0xPolygon/cdk/bridgesync"
+	"github.com/0xPolygon/cdk/btcman"
 	"github.com/0xPolygon/cdk/claimsponsor"
 	"github.com/0xPolygon/cdk/common"
 	ethermanconfig "github.com/0xPolygon/cdk/etherman/config"
@@ -93,6 +94,8 @@ You could find some examples:
 type Config struct {
 	// Configuration of the etherman (client for access L1)
 	Etherman ethermanconfig.Config
+	// Configuration of the bitcoin manager
+	Btcman btcman.Config
 	// Configuration for ethereum transaction manager
 	EthTxManager ethtxmanager.Config
 	// Configuration of the aggregator
