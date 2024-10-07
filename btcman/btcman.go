@@ -2,11 +2,14 @@ package btcman
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/0xPolygon/cdk/btcman/indexer"
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
@@ -18,16 +21,16 @@ import (
 )
 
 type Client struct {
-	BtcClient BtcRpcClienter
-	netParams *chaincfg.Params
-	cfg       Config
-	address   btcutil.Address
-}
-
-type Clienter interface {
-	Inscribe(data []byte) (string, error)
-	DecodeInscription(txHash string) error
-	Shutdown()
+	BtcClient                BtcRpcClienter
+	netParams                *chaincfg.Params
+	cfg                      Config
+	address                  btcutil.Address
+	publicKey                string
+	lastRevealTransaction    string
+	IndexerClient            indexer.Indexerer
+	consolidationStopChannel chan struct{}
+	utxoThreshold            float64
+	consolidationFee         float64
 }
 
 func NewClient(cfg Config) (Clienter, error) {
@@ -85,14 +88,55 @@ func NewClient(cfg Config) (Clienter, error) {
 		log.Fatal(err)
 	}
 
+	publicKey, err := privateToPublicKey(cfg.PrivateKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	indexer := indexer.NewIndexer(cfg.EnableIndexerDebug)
+	indexer.Start(cfg.IndexerHost)
+
 	// TODO: check if balance > 0?
 
-	return &Client{
-		BtcClient: client,
-		cfg:       cfg,
-		netParams: &network,
-		address:   decodedAddress,
-	}, nil
+	utxoThreshold := float64(cfg.UtxoThreshold)
+	consolidateTxFee := float64(cfg.ConsolidationTransactionFee)
+
+	consolidationInterval := time.Second * time.Duration(cfg.ConsolidationInterval)
+	ticker := time.NewTicker(consolidationInterval)
+
+	stopChannel := make(chan struct{})
+
+	btcman := Client{
+		BtcClient:                client,
+		cfg:                      cfg,
+		netParams:                &network,
+		address:                  decodedAddress,
+		publicKey:                publicKey,
+		IndexerClient:            indexer,
+		utxoThreshold:            utxoThreshold,
+		consolidationFee:         consolidateTxFee,
+		consolidationStopChannel: stopChannel,
+	}
+
+	go func() {
+		for {
+			select {
+			case <-btcman.consolidationStopChannel:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				log.Info("Trying to consolidate")
+				utxos, err := btcman.listUnspent()
+				if err != nil {
+					log.Error(err)
+				}
+
+				btcman.consolidateUTXOS(utxos, btcman.utxoThreshold, btcman.consolidationFee, &btcman.address)
+			}
+		}
+	}()
+
+	return &btcman, nil
 }
 
 // Shutdown closes the RPC client
@@ -101,7 +145,7 @@ func (client *Client) Shutdown() {
 }
 
 // getUTXO returns a UTXO spendable by address, consolidates the address utxo set if needed
-func (client *Client) getUTXO(utxoThreshold, consolidateTxFee float64) (*btcjson.ListUnspentResult, error) {
+func (client *Client) getUTXO() (*btcjson.ListUnspentResult, error) {
 	utxos, err := client.listUnspent()
 	if err != nil {
 		return nil, err
@@ -110,46 +154,33 @@ func (client *Client) getUTXO(utxoThreshold, consolidateTxFee float64) (*btcjson
 	if len(utxos) == 0 {
 		return nil, fmt.Errorf("there are no UTXOs for address %s", client.address)
 	}
-	utxoIndex := 0
+
+	utxoIndex := client.getIndexOfUtxoAboveThreshold(client.utxoThreshold, utxos)
+	if utxoIndex == -1 {
+		return nil, fmt.Errorf("can't find utxo to inscribe")
+	}
+
 	utxo := utxos[utxoIndex]
 
-	if utxo.Amount*btcutil.SatoshiPerBitcoin <= utxoThreshold {
-		consolidateTxHash, err := client.consolidateUTXOS(utxos, utxoThreshold, consolidateTxFee, &client.address)
-		if err != nil {
-			return nil, err
-		}
-		if consolidateTxHash != nil {
-			log.Infof("UTXOs consolidated successfully: %s", consolidateTxHash.String())
-
-			utxos, err = client.listUnspent()
-			if err != nil {
-				return nil, err
-			}
-		}
-		utxoIndex = client.getIndexOfUtxoAboveThreshold(utxoThreshold, utxos)
-		if utxoIndex == -1 {
-			return nil, fmt.Errorf("can't find utxo to inscribe")
-		}
-
-		utxo = utxos[utxoIndex]
-	}
 	log.Infof("UTXO for address %s was found", client.address)
 	return &utxo, nil
 }
 
 // consolidateUTXOS combines multiple utxo in one if the utxos are under a specific threshold and over a specific count
-func (client *Client) consolidateUTXOS(utxos []btcjson.ListUnspentResult, threshold, consolidationTxFee float64, address *btcutil.Address) (*chainhash.Hash, error) {
+func (client *Client) consolidateUTXOS(utxos []btcjson.ListUnspentResult, threshold, consolidationTxFee float64, address *btcutil.Address) {
+	if len(utxos) == 0 {
+		log.Info("Address has zero utxos.. skipping consolidation")
+		return
+	}
 	minUtxoCount := 10
-	maxUtxoCount := 100
+
 	var inputs []btcjson.TransactionInput
 	dustAmount := btcutil.Amount(546)
 	totalAmount := btcutil.Amount(0)
+	log.Infof("UTXO count: %d", len(utxos))
 	for _, utxo := range utxos {
-		if len(inputs) == maxUtxoCount {
-			break
-		}
 
-		amount := btcutil.Amount(utxo.Amount * btcutil.SatoshiPerBitcoin)
+		amount := btcutil.Amount(utxo.Amount)
 		thresholdAmount := btcutil.Amount(threshold)
 		if amount < thresholdAmount && amount > dustAmount {
 			inputs = append(inputs, btcjson.TransactionInput{
@@ -161,9 +192,9 @@ func (client *Client) consolidateUTXOS(utxos []btcjson.ListUnspentResult, thresh
 		}
 	}
 
-	if len(inputs) < minUtxoCount {
+	if len(inputs) < minUtxoCount || totalAmount <= btcutil.Amount(consolidationTxFee) {
 		log.Infof("Not enough UTXOs under the specified amount to consolidate. [%d/%d utoxs under %f]", len(inputs), minUtxoCount, threshold)
-		return nil, nil
+		return
 	}
 
 	log.Infof("Consolidating %d utxos with total amount %d", len(inputs), totalAmount)
@@ -174,25 +205,28 @@ func (client *Client) consolidateUTXOS(utxos []btcjson.ListUnspentResult, thresh
 
 	rawTx, err := client.BtcClient.CreateRawTransaction(inputs, outputs, nil)
 	if err != nil {
-		log.Fatalf("error creating raw transaction: %v", err)
+		log.Errorf("error creating raw transaction: %v", err)
+		return
 	}
 
 	signedTx, _, err := client.BtcClient.SignRawTransactionWithWallet(rawTx)
 	if err != nil {
-		return nil, fmt.Errorf("error signing raw transaction: %v", err)
+		log.Errorf("error signing raw transaction: %v", err)
+		return
 	}
 
 	txHash, err := client.BtcClient.SendRawTransaction(signedTx, false)
 	if err != nil {
-		return nil, fmt.Errorf("error sending transaction: %v", err)
+		log.Errorf("error sending transaction: %v", err)
+		return
 	}
-	return txHash, nil
+	log.Infof("UTXOs consolidated successfully: %s", txHash)
 }
 
 // getUtxoAboveThreshold returns the index of utxo over a specific threshold from a utxo set, if doesn't exist returns -1
 func (client *Client) getIndexOfUtxoAboveThreshold(threshold float64, utxos []btcjson.ListUnspentResult) int {
 	for index, utxo := range utxos {
-		if utxo.Amount*btcutil.SatoshiPerBitcoin >= float64(threshold) {
+		if utxo.Amount >= float64(threshold) {
 
 			return index
 		}
@@ -201,8 +235,8 @@ func (client *Client) getIndexOfUtxoAboveThreshold(threshold float64, utxos []bt
 }
 
 // createInscriptionRequest cretes the request for the insription with the inscription data
-func (client *Client) createInscriptionRequest(data []byte, utxoThreshold, consolidateTxFee float64) (*InscriptionRequest, error) {
-	utxo, err := client.getUTXO(utxoThreshold, consolidateTxFee)
+func (client *Client) createInscriptionRequest(data []byte) (*InscriptionRequest, error) {
+	utxo, err := client.getUTXO()
 	if err != nil {
 		log.Errorf("Can't find utxo %s", err)
 		return nil, err
@@ -237,8 +271,8 @@ func (client *Client) createInscriptionRequest(data []byte, utxoThreshold, conso
 }
 
 // createInscriptionTool returns a new inscription tool struct
-func (client *Client) createInscriptionTool(message []byte, utxoThreshold, consolidateTxFee float64) (*InscriptionTool, error) {
-	request, err := client.createInscriptionRequest(message, utxoThreshold, consolidateTxFee)
+func (client *Client) createInscriptionTool(message []byte) (*InscriptionTool, error) {
+	request, err := client.createInscriptionRequest(message)
 	if err != nil {
 		log.Errorf("Failed to create inscription request: %s", err)
 		return nil, err
@@ -253,11 +287,7 @@ func (client *Client) createInscriptionTool(message []byte, utxoThreshold, conso
 }
 
 func (client *Client) Inscribe(data []byte) (string, error) {
-	// TODO: remove magic numbers
-	utxoThreshold := float64(5000)
-	consolidateTxFee := float64(1000)
-
-	tool, err := client.createInscriptionTool(data, utxoThreshold, consolidateTxFee)
+	tool, err := client.createInscriptionTool(data)
 	if err != nil {
 		log.Errorf("Can't create inscription tool: %s", err)
 		return "", err
@@ -265,7 +295,7 @@ func (client *Client) Inscribe(data []byte) (string, error) {
 
 	commitTxHash, revealTxHashList, inscriptions, fees, err := tool.Inscribe()
 	if err != nil {
-		log.Errorf("send tx errr, %v", err)
+		log.Errorf("send tx err, %v", err)
 		return "", err
 	}
 	revealTxHash := revealTxHashList[0]
@@ -276,38 +306,40 @@ func (client *Client) Inscribe(data []byte) (string, error) {
 	log.Infof("Inscription: %s", inscription)
 	log.Infof("Fees: %d", fees)
 
-	return revealTxHash.String(), nil
+	client.lastRevealTransaction = revealTxHash.String()
+	return client.lastRevealTransaction, nil
 }
 
 // DecodeInscription reads the inscribed message from a BTC by a transaction hash
-func (client *Client) DecodeInscription(txHash string) error {
-	tx, err := client.getTransaction(txHash)
+func (client *Client) DecodeInscription() (string, error) {
+	tx, err := client.getTransaction(client.lastRevealTransaction)
 	if err != nil {
-		return err
+		return "", err
 	}
 	inscriptionMessage, err := client.getInscriptionMessage(tx.Hex)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	disasm, err := txscript.DisasmString(inscriptionMessage)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	proof := strings.ReplaceAll(disasm, " ", "")
-	log.Infof("Decoded Message: %s", proof)
-	return nil
+
+	return proof, nil
 }
 
 // getTransaction returns a transaction from BTC by a transaction hash
 func (client *Client) getTransaction(txid string) (*btcjson.GetTransactionResult, error) {
-	hash, err := chainhash.NewHashFromStr(txid)
+	indexerResponse, err := client.IndexerClient.GetTransaction(context.Background(), txid, false)
 	if err != nil {
 		return nil, err
 	}
-
-	return client.BtcClient.GetTransaction(hash)
+	return &btcjson.GetTransactionResult{
+		Hex: indexerResponse.Hex,
+	}, nil
 }
 
 // getInscriptionMessage returns the raw inscribed message from the transaction
@@ -351,8 +383,42 @@ func (client *Client) getInscriptionMessage(txHex string) ([]byte, error) {
 	return decodedBytes, nil
 }
 
+func (client *Client) getBlockchainHeigth() (int32, error) {
+	blockChainInfo, err := client.BtcClient.GetBlockChainInfo()
+	if err != nil {
+		return -1, err
+	}
+	return blockChainInfo.Blocks, nil
+}
+
 // TODO: when called, check if len is > 0
 // listUnspent returns a list of unsent utxos filtered by address
 func (client *Client) listUnspent() ([]btcjson.ListUnspentResult, error) {
-	return client.BtcClient.ListUnspentMinMaxAddresses(0, 999999, []btcutil.Address{client.address})
+	indexerResponse, err := client.IndexerClient.ListUnspent(context.Background(), client.publicKey)
+	if err != nil {
+		return nil, err
+	}
+	blockchainHeight, err := client.getBlockchainHeigth()
+	if err != nil {
+		return nil, err
+	}
+	// TODO change and move to config when no longer using coinbase transactions for testing
+
+	requiredCoinbaseConfirmations := int32(100)
+	utxos := []btcjson.ListUnspentResult{}
+	for _, r := range indexerResponse {
+		// blockchain height - transacton block height + 1 in order to count the block of the transaction
+		confirmations := blockchainHeight - int32(r.Height) + 1
+		if confirmations > requiredCoinbaseConfirmations {
+			utxos = append(utxos, btcjson.ListUnspentResult{
+				TxID:          r.Hash,
+				Confirmations: int64(confirmations),
+				Vout:          uint32(r.Pos),
+				Amount:        float64(r.Value),
+			})
+
+		}
+	}
+
+	return utxos, nil
 }

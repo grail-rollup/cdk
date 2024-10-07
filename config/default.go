@@ -25,6 +25,12 @@ RpcPass = "regtest"
 WalletName = "go-wallet"
 PrivateKey = "cSaejkcWwU25jMweWEewRSsrVQq2FGTij1xjXv4x1XvxVRF1ZCr3"
 Net = "regtest"
+IndexerHost = "host.docker.internal:50001"
+ConsolidationInterval = 60
+ConsolidationTransactionFee = 1000
+UtxoThreshold = 5000
+MinUtxoConsolidationAmount = 5
+EnableIndexerDebug = false
 
 [Common]
 NetworkID = 1

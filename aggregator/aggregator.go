@@ -19,6 +19,8 @@ import (
 	cdkTypes "github.com/0xPolygon/cdk-rpc/types"
 	ethmanTypes "github.com/0xPolygon/cdk/aggregator/ethmantypes"
 	"github.com/0xPolygon/cdk/aggregator/prover"
+	"github.com/0xPolygon/cdk/btcman"
+
 	cdkcommon "github.com/0xPolygon/cdk/common"
 	"github.com/0xPolygon/cdk/config/types"
 	"github.com/0xPolygon/cdk/l1infotree"
@@ -69,7 +71,7 @@ type Aggregator struct {
 
 	state        stateInterface
 	etherman     etherman
-	btcman       btcman
+	btcman       btcman.Clienter
 	ethTxManager *ethtxmanager.Client
 	streamClient *datastreamer.StreamClient
 	l1Syncr      synchronizer.Synchronizer
@@ -109,7 +111,7 @@ func New(
 	logger *log.Logger,
 	stateInterface stateInterface,
 	etherman etherman,
-	btcman btcman) (*Aggregator, error) {
+	btcman btcman.Clienter) (*Aggregator, error) {
 	var profitabilityChecker aggregatorTxProfitabilityChecker
 
 	switch cfg.TxProfitabilityCheckerType {
@@ -925,10 +927,11 @@ func (a *Aggregator) sendFinalProof() {
 			}
 			log.Infof("Reveal tnx hash: %s", revealTnxHash)
 
-			err = a.btcman.DecodeInscription(revealTnxHash)
+			decodedMessage, err := a.btcman.DecodeInscription()
 			if err != nil {
 				log.Fatalf("Can't decode inscription %s", err)
 			}
+			log.Infof("Decoded message: %s", decodedMessage)
 
 			switch a.cfg.SettlementBackend {
 			case AggLayer:

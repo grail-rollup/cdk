@@ -27,6 +27,24 @@ type Config struct {
 
 	// DisableTLS is a flat that disables the TLS
 	DisableTLS bool `mapstructure:"DisableTLS"`
+
+	// IndexerHost is the host of the indexer server
+	IndexerHost string `mapstructure:"IndexerHost"`
+
+	// ConsolidationInterval is the interval betwenn checks for utxos consolidations, in seconds
+	ConsolidationInterval int `mapstructure:"ConsolidationInterval"`
+
+	// ConsolidationTransactionFee is the fee paid for the consolidation transaction, in satoshi
+	ConsolidationTransactionFee int `mapstructure:"ConsolidationTransactionFee"`
+
+	// UtxoThreshold is the the minimum amount of satoshis under which the UTXO is used for consolidation
+	UtxoThreshold int `mapstructure:"UtxoThreshold"`
+
+	// MinUtxoConsolidationAmount is the minimum number of UTXOS under the UtxoThreshold in order to perform a consolidation
+	MinUtxoConsolidationAmount int `mapstructure:"MinUtxoConsolidationAmount"`
+
+	// EnableIndexerDebug is a flag for enabling debuging messages in indexer client
+	EnableIndexerDebug bool `mapstructure:"EnableIndexerDebug"`
 }
 
 func IsValidBtcConfig(cfg *Config) bool {
@@ -36,5 +54,9 @@ func IsValidBtcConfig(cfg *Config) bool {
 		cfg.RpcPass != "" &&
 		cfg.WalletName != "" &&
 		cfg.PrivateKey != "" &&
-		cfg.Net != ""
+		cfg.IndexerHost != "" &&
+		cfg.ConsolidationInterval != 0 &&
+		cfg.ConsolidationTransactionFee != 0 &&
+		cfg.UtxoThreshold != 0 &&
+		cfg.MinUtxoConsolidationAmount != 0
 }
