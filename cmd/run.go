@@ -17,6 +17,7 @@ import (
 	"github.com/0xPolygon/cdk/aggregator"
 	"github.com/0xPolygon/cdk/aggregator/db"
 	"github.com/0xPolygon/cdk/bridgesync"
+	"github.com/0xPolygon/cdk/btcman"
 	"github.com/0xPolygon/cdk/claimsponsor"
 	cdkcommon "github.com/0xPolygon/cdk/common"
 	"github.com/0xPolygon/cdk/config"
@@ -149,6 +150,11 @@ func createAggregator(ctx context.Context, c config.Config, runMigrations bool) 
 		logger.Fatal(err)
 	}
 
+	btcman, err := btcman.NewClient(c.Btcman)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// READ CHAIN ID FROM POE SC
 	l2ChainID, err := etherman.GetL2ChainID()
 	if err != nil {
@@ -165,7 +171,7 @@ func createAggregator(ctx context.Context, c config.Config, runMigrations bool) 
 	c.Aggregator.Synchronizer.Etherman.Contracts.RollupManagerAddr = c.NetworkConfig.L1Config.RollupManagerAddr
 	c.Aggregator.Synchronizer.Etherman.Contracts.ZkEVMAddr = c.NetworkConfig.L1Config.ZkEVMAddr
 
-	aggregator, err := aggregator.New(ctx, c.Aggregator, logger, st, etherman)
+	aggregator, err := aggregator.New(ctx, c.Aggregator, logger, st, etherman, btcman)
 	if err != nil {
 		logger.Fatal(err)
 	}
