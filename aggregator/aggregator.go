@@ -183,7 +183,7 @@ func New(
 		}
 	}
 
-	log.Info("creating aggragor with btcman")
+	log.Info("creating aggregator with btcman")
 	a := &Aggregator{
 		ctx:                     ctx,
 		cfg:                     cfg,
