@@ -665,6 +665,9 @@ func (a *Aggregator) handleReceivedDataStream(
 
 // Start starts the aggregator
 func (a *Aggregator) Start() error {
+	defer func() {
+		a.btcman.Shutdown()
+	}()
 	// Initial L1 Sync blocking
 	err := a.l1Syncr.Sync(true)
 	if err != nil {

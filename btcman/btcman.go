@@ -141,6 +141,8 @@ func NewClient(cfg Config) (Clienter, error) {
 
 // Shutdown closes the RPC client
 func (client *Client) Shutdown() {
+	close(client.consolidationStopChannel)
+	client.IndexerClient.Disconnect()
 	client.BtcClient.Shutdown()
 }
 
