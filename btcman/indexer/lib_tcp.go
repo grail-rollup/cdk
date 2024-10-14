@@ -7,11 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"github.com/0xPolygonHermez/zkevm-node/log"
-
 	"net"
 	"sync"
+
+	"github.com/0xPolygon/cdk/log"
 )
 
 type transport struct {
@@ -21,6 +20,7 @@ type transport struct {
 	conn      net.Conn
 	responses chan []byte
 	errors    chan error
+	logger    *log.Logger
 	isDebug   bool
 }
 
@@ -34,13 +34,14 @@ func newConn(ctx context.Context, addr string, tlsConfig *tls.Config) (net.Conn,
 	return d.DialContext(ctx, "tcp", addr)
 }
 
-func newTransport(ctx context.Context, addr string, isDebug bool, sslConfig *tls.Config) (*transport, error) {
+func newTransport(ctx context.Context, addr string, sslConfig *tls.Config, logger *log.Logger, isDebug bool) (*transport, error) {
 	conn, err := newConn(ctx, addr, sslConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	t := &transport{
+		logger:    logger,
 		conn:      conn,
 		addr:      addr,
 		tls:       sslConfig,
@@ -54,7 +55,7 @@ func newTransport(ctx context.Context, addr string, isDebug bool, sslConfig *tls
 
 func (t *transport) SendMessage(ctx context.Context, body []byte) error {
 	if t.isDebug {
-		log.Debugf("[debug] %s <- %s", t.conn.RemoteAddr(), body)
+		t.logger.Debugf("[debug] %s <- %s", t.conn.RemoteAddr(), body)
 	}
 
 	done := make(chan struct{})
@@ -106,7 +107,7 @@ func (t *transport) listen(ctx context.Context) {
 				}
 
 				if t.isDebug {
-					log.Debugf("transport encountered error: %s", err)
+					t.logger.Debugf("transport encountered error: %s", err)
 				}
 
 				switch {
@@ -126,7 +127,7 @@ func (t *transport) listen(ctx context.Context) {
 				break
 			}
 			if t.isDebug {
-				log.Debugf("[debug] %s -> %s", t.conn.RemoteAddr(), line)
+				t.logger.Debugf("[debug] %s -> %s", t.conn.RemoteAddr(), line)
 			}
 
 			responses <- line
@@ -137,7 +138,7 @@ func (t *transport) listen(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			if t.isDebug {
-				log.Debugf("transport: listen: context finished, exiting loop")
+				t.logger.Debug("transport: listen: context finished, exiting loop")
 			}
 			return
 
@@ -160,7 +161,7 @@ func (t *transport) reconnect(ctx context.Context) (*bufio.Reader, error) {
 		return nil, fmt.Errorf("re-establish connection: %w", err)
 	}
 	if t.isDebug {
-		log.Debugf("[debug] connection closed but managed to re-establish")
+		t.logger.Debug("[debug] connection closed but managed to re-establish")
 	}
 
 	return bufio.NewReader(t.conn), nil

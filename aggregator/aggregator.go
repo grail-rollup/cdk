@@ -913,28 +913,27 @@ func (a *Aggregator) sendFinalProof() {
 			proofData := strings.TrimPrefix(inputs.FinalProof.Proof, "0x")
 			message := fmt.Sprintf("%s%s%s", newLocalExitRoot, newStateRoot, proofData)
 
-			log.Info("testtest")
-			log.Debugf("newLocalExitRoot: %s", newLocalExitRoot)
-			log.Debugf("newStateRoot: %s", newStateRoot)
-			log.Debugf("proof data: %s", proofData)
-			log.Debugf("message: %s", message)
+			a.logger.Info("testtest")
+			a.logger.Debugf("newLocalExitRoot: %s", newLocalExitRoot)
+			a.logger.Debugf("newStateRoot: %s", newStateRoot)
+			a.logger.Debugf("proof data: %s", proofData)
+			a.logger.Debugf("message: %s", message)
 
 			messageBytes, err := hex.DecodeString(message)
 			if err != nil {
-				log.Fatalf("Can't decode message %s", err)
+				a.logger.Fatalf("Can't decode message %s", err)
 			}
 
-			revealTnxHash, err := a.btcman.Inscribe(messageBytes)
+			err = a.btcman.Inscribe(messageBytes)
 			if err != nil {
-				log.Fatalf("Can't create inscription %s", err)
+				a.logger.Fatalf("Can't create inscription %s", err)
 			}
-			log.Infof("Reveal tnx hash: %s", revealTnxHash)
 
 			decodedMessage, err := a.btcman.DecodeInscription()
 			if err != nil {
-				log.Fatalf("Can't decode inscription %s", err)
+				a.logger.Fatalf("Can't decode inscription %s", err)
 			}
-			log.Infof("Decoded message: %s", decodedMessage)
+			a.logger.Infof("Decoded message: %s", decodedMessage)
 
 			switch a.cfg.SettlementBackend {
 			case AggLayer:

@@ -12,7 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/0xPolygonHermez/zkevm-node/log"
+	"github.com/0xPolygon/cdk/log"
+
+	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/wire"
 )
 
 const delim = byte('\n')
@@ -22,61 +26,71 @@ var (
 	ErrIndexerShutdown  = errors.New("indexer has shutdown")
 )
 
+type response struct {
+	Id     uint64 `json:"id"`
+	Method string `json:"method"`
+	Error  any    `json:"error"`
+}
+
+type request struct {
+	Id     uint64        `json:"id"`
+	Method string        `json:"method"`
+	Params []interface{} `json:"params"`
+}
+
 type container struct {
 	content []byte
 	err     error
 }
 
+// Indexer comunicates with the btc indexer
 type Indexer struct {
-	transport *transport
-
-	handlersLock sync.RWMutex
-	handlers     map[uint64]chan *container
-
+	logger           *log.Logger
+	transport        *transport
+	handlersLock     sync.RWMutex
+	handlers         map[uint64]chan *container
 	pushHandlersLock sync.RWMutex
 	pushHandlers     map[string][]chan *container
-
-	errs chan error
-	quit chan struct{}
-
-	nextId  uint64
-	isDebug bool
+	errs             chan error
+	quit             chan struct{}
+	nextId           uint64
+	isDebug          bool
 }
 
-// NewIndexer creates a new indexerer.
-func NewIndexer(isDebug bool) Indexerer {
+func NewIndexer(isDebug bool, logger *log.Logger) *Indexer {
+
 	i := &Indexer{
+		logger:       logger,
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
-
-		errs:    make(chan error),
-		quit:    make(chan struct{}),
-		isDebug: isDebug,
+		errs:         make(chan error),
+		quit:         make(chan struct{}),
+		isDebug:      isDebug,
 	}
 
 	return i
 }
 
-// Start the indexer goroutines
+// Start initializes the indexer goroutines
 func (i *Indexer) Start(serverAddress string) {
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
-	connectCancelationInterval := 3
-	connectCtx, _ := context.WithTimeout(ctx, time.Second*time.Duration(connectCancelationInterval))
+
+	connectCtx, _ := context.WithTimeout(ctx, time.Second*3)
 	if err := i.connect(connectCtx, serverAddress, nil); err != nil {
-		fmt.Printf("connect node: %v", err)
+		i.logger.Debugf("connect node: %v", err)
 		return
 	}
 
 	go func() {
 		err := <-i.errors()
-		log.Errorf("ran into error: %s", err)
+		i.logger.Errorf("ran into error: %s", err)
 		i.Disconnect()
 	}()
 	indexerPingInterval := 5
 	go func() {
 		for {
 			if err := i.ping(ctx); err != nil {
-				log.Fatal(err)
+				i.logger.Fatal(err)
 			}
 
 			select {
@@ -89,7 +103,7 @@ func (i *Indexer) Start(serverAddress string) {
 	}()
 }
 
-// errors returns any errors the node ran into while listening to messages.
+// errors returns any errors the indexer ran into while listening to messages.
 func (i *Indexer) errors() <-chan error {
 	return i.errs
 }
@@ -101,7 +115,7 @@ func (i *Indexer) connect(ctx context.Context, addr string, config *tls.Config) 
 		return ErrIndexerConnected
 	}
 
-	transport, err := newTransport(ctx, addr, i.isDebug, config)
+	transport, err := newTransport(ctx, addr, config, i.logger, i.isDebug)
 	if err != nil {
 		return err
 	}
@@ -112,7 +126,7 @@ func (i *Indexer) connect(ctx context.Context, addr string, config *tls.Config) 
 		i.transport.listen(listenCtx)
 	}()
 
-	// Quit the transport listening once the node shuts down
+	// Quit the transport listening once the indexer shuts down
 	go func() {
 		<-i.quit
 		cancel()
@@ -127,14 +141,14 @@ func (i *Indexer) connect(ctx context.Context, addr string, config *tls.Config) 
 func (i *Indexer) listen(ctx context.Context) {
 	for {
 		if i.transport == nil {
-			log.Infof("Transport is nil inside Indexer.listen(), exiting loop")
+			i.logger.Warn("Transport is nil inside Indexer.listen(), exiting loop")
 			return
 		}
 
 		select {
 		case <-ctx.Done():
 			if i.isDebug {
-				log.Infof("indexer: listen: context finished, exiting loop")
+				i.logger.Debug("indexer: listen: context finished, exiting loop")
 			}
 			return
 
@@ -148,8 +162,8 @@ func (i *Indexer) listen(ctx context.Context) {
 
 			msg := &response{}
 			if err := json.Unmarshal(bytes, msg); err != nil {
-				if i.transport.isDebug {
-					log.Errorf("unmarshal received message failed: %v", err)
+				if i.isDebug {
+					i.logger.Debugf("unmarshal received message failed: %v", err)
 				}
 
 				result.err = fmt.Errorf("unmarshal received message failed: %v", err)
@@ -245,12 +259,12 @@ func (i *Indexer) Disconnect() {
 	}
 
 	if i.transport == nil {
-		log.Warn("WARNING: disconnecting indexer before transport is set up")
+		i.logger.Warn("WARNING: disconnecting indexer before transport is set up")
 		return
 	}
 
 	if i.isDebug {
-		log.Info("disconnecting indexer")
+		i.logger.Debug("disconnecting indexer")
 	}
 
 	close(i.quit)
@@ -261,26 +275,27 @@ func (i *Indexer) Disconnect() {
 	i.pushHandlers = nil
 }
 
+// ping the server in order to keep the connection open
 func (i *Indexer) ping(ctx context.Context) error {
 	const method string = "server.ping"
 	err := i.request(ctx, method, []interface{}{}, nil)
-	log.Info("Pinging indexer server")
+	log.Debug("Pinging indexer server")
 	return err
 }
 
-// GetTransaction returns a transaction by its transaction id
-func (i *Indexer) GetTransaction(ctx context.Context, txID string, verbose bool) (*GetTransaction, error) {
+// GetTransaction returns a transaction from the btc indexer
+func (i *Indexer) GetTransaction(ctx context.Context, txID string, verbose bool) (*btcjson.TxRawResult, error) {
 	if !verbose {
 		hex, err := i.blockchainTransactionGetNonVerbose(ctx, txID)
 		if err != nil {
 			return nil, err
 		}
 
-		return &GetTransaction{Hex: hex}, nil
+		return &btcjson.TxRawResult{Hex: hex}, nil
 	}
 	const method string = "blockchain.transaction.get"
 	resp := &struct {
-		Result GetTransaction `json:"result"`
+		Result btcjson.TxRawResult `json:"result"`
 	}{}
 	err := i.request(ctx, method, []interface{}{txID, verbose}, resp)
 	if err != nil {
@@ -290,7 +305,7 @@ func (i *Indexer) GetTransaction(ctx context.Context, txID string, verbose bool)
 	return &resp.Result, nil
 }
 
-// blockchainTransactionGetNonVerbose returns a transaction by its transaction id
+// blockchainTransactionGetNonVerbose handles the nonverbose transaction request
 func (i *Indexer) blockchainTransactionGetNonVerbose(ctx context.Context, txid string) (string, error) {
 	const method string = "blockchain.transaction.get"
 	resp := struct {
@@ -304,11 +319,11 @@ func (i *Indexer) blockchainTransactionGetNonVerbose(ctx context.Context, txid s
 	return resp.Result, nil
 }
 
-// ListUnspent returns a list of unspend utxos by a publicKey
-func (i *Indexer) ListUnspent(ctx context.Context, publicKey string) ([]*Transaction, error) {
+// ListUnspent returns a list of unspent UTXOs by given publicKey
+func (i *Indexer) ListUnspent(ctx context.Context, publicKey string) ([]*UTXO, error) {
 	const method string = "blockchain.scripthash.listunspent"
 	resp := &struct {
-		Result []*Transaction `json:"result"`
+		Result []*UTXO `json:"result"`
 	}{}
 	scriptHash, err := publicKeyToScriptHash(publicKey)
 	if err != nil {
@@ -320,4 +335,78 @@ func (i *Indexer) ListUnspent(ctx context.Context, publicKey string) ([]*Transac
 	}
 
 	return resp.Result, nil
+}
+
+// SendTransaction broadcasts a transaction to the btc node
+func (i *Indexer) SendTransaction(ctx context.Context, tx *wire.MsgTx) (string, error) {
+	txHex, err := GetTxHex(tx)
+	if err != nil {
+		return "", err
+	}
+
+	const method string = "blockchain.transaction.broadcast"
+	resp := &struct {
+		Result string `json:"result"`
+	}{}
+	err = i.request(ctx, method, []interface{}{txHex}, resp)
+	if err != nil {
+		return "", err
+	}
+	return resp.Result, nil
+}
+
+// GetBlockchainInfo returns the latest information about the btc blockchain
+func (i *Indexer) GetBlockchainInfo(ctx context.Context) (*BlockChainInfo, error) {
+	const method string = "blockchain.headers.subscribe"
+	resp := &struct {
+		Result BlockChainInfo `json:"result"`
+	}{}
+	err := i.request(ctx, method, []interface{}{}, resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Result, nil
+}
+
+// GetLastInscribedTransactionByPublicKey returns the txInfo of the last reveal inscription transaction added in a block
+func (i *Indexer) GetLastInscribedTransactionByPublicKey(ctx context.Context, publicKey string, blockchainHeight int32, utxoThreshold float64) (*TxInfo, error) {
+	scriptHash, err := publicKeyToScriptHash(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	const method = "blockchain.scripthash.get_history"
+	resp := &struct {
+		Result []TxInfo `json:"result"`
+	}{}
+
+	if err = i.request(ctx, method, []interface{}{scriptHash}, resp); err != nil {
+		return nil, err
+	}
+
+	// get transactions only in last block
+	transactionsInLastBlock := []TxInfo{}
+	for _, tx := range resp.Result {
+		if tx.Height == blockchainHeight {
+			transactionsInLastBlock = append(transactionsInLastBlock, tx)
+		}
+	}
+
+	for _, tx := range transactionsInLastBlock {
+
+		rawTx, err := i.GetTransaction(ctx, tx.TxHash, true)
+		if err != nil {
+			return nil, err
+		}
+		amount := float64(0)
+		for _, vout := range rawTx.Vout {
+			amount += vout.Value
+		}
+
+		// get only the review transaction
+		if amount*btcutil.SatoshiPerBitcoin < utxoThreshold {
+			i.logger.Debugf("Tx: %s, Amount: %f, Threshold: %f", tx.TxHash, amount*btcutil.SatoshiPerBitcoin, utxoThreshold)
+			return &tx, nil
+		}
+	}
+	return nil, NewNoInscriptionError()
 }

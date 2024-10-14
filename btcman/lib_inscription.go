@@ -1,11 +1,11 @@
 package btcman
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
-	"log"
 
+	"github.com/0xPolygon/cdk/btcman/indexer"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -47,7 +47,8 @@ type inscriptionTxCtxData struct {
 }
 
 type blockchainClient struct {
-	rpcClient BtcRpcClienter
+	indexerClient indexer.Indexerer
+	keychain      Keychainer
 }
 
 type InscriptionTool struct {
@@ -68,11 +69,12 @@ const (
 	MaxStandardTxWeight = blockchain.MaxBlockWeight / 10
 )
 
-func NewInscriptionTool(net *chaincfg.Params, rpcclient BtcRpcClienter, request *InscriptionRequest) (*InscriptionTool, error) {
+func NewInscriptionTool(net *chaincfg.Params, request *InscriptionRequest, indexerClient indexer.Indexerer, keychain Keychainer) (*InscriptionTool, error) {
 	tool := &InscriptionTool{
 		net: net,
 		client: &blockchainClient{
-			rpcClient: rpcclient,
+			indexerClient: indexerClient,
+			keychain:      keychain,
 		},
 		commitTxPrevOutputFetcher: txscript.NewMultiPrevOutFetcher(nil),
 		txCtxDataList:             make([]*inscriptionTxCtxData, len(request.DataList)),
@@ -257,7 +259,8 @@ func (tool *InscriptionTool) buildEmptyRevealTx(singleRevealTxOnly bool, destina
 
 func (tool *InscriptionTool) getTxOutByOutPoint(outPoint *wire.OutPoint) (*wire.TxOut, error) {
 	var txOut *wire.TxOut
-	tx, err := tool.client.rpcClient.GetRawTransactionVerbose(&outPoint.Hash)
+	tx, err := tool.client.indexerClient.GetTransaction(context.Background(), outPoint.Hash.String(), true)
+
 	if err != nil {
 		return nil, err
 	}
@@ -368,15 +371,10 @@ func (tool *InscriptionTool) completeRevealTx() error {
 
 func (tool *InscriptionTool) signCommitTx() error {
 	if len(tool.commitTxPrivateKeyList) == 0 {
-		commitSignTransaction, isSignComplete, err := tool.client.rpcClient.SignRawTransactionWithWallet(tool.commitTx)
+		err := tool.client.keychain.SignTransaction(tool.commitTx, tool.client.indexerClient)
 		if err != nil {
-			log.Printf("sign commit tx error, %v", err)
 			return err
 		}
-		if !isSignComplete {
-			return errors.New("sign commit tx error")
-		}
-		tool.commitTx = commitSignTransaction
 	} else {
 		witnessList := make([]wire.TxWitness, len(tool.commitTx.TxIn))
 		for i := range tool.commitTx.TxIn {
@@ -395,22 +393,14 @@ func (tool *InscriptionTool) signCommitTx() error {
 	return nil
 }
 
-func getTxHex(tx *wire.MsgTx) (string, error) {
-	var buf bytes.Buffer
-	if err := tx.Serialize(&buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf.Bytes()), nil
-}
-
 func (tool *InscriptionTool) GetCommitTxHex() (string, error) {
-	return getTxHex(tool.commitTx)
+	return indexer.GetTxHex(tool.commitTx)
 }
 
 func (tool *InscriptionTool) GetRevealTxHexList() ([]string, error) {
 	txHexList := make([]string, len(tool.revealTx))
 	for i := range tool.revealTx {
-		txHex, err := getTxHex(tool.revealTx[i])
+		txHex, err := indexer.GetTxHex(tool.revealTx[i])
 		if err != nil {
 			return nil, err
 		}
@@ -420,7 +410,16 @@ func (tool *InscriptionTool) GetRevealTxHexList() ([]string, error) {
 }
 
 func (tool *InscriptionTool) sendRawTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
-	return tool.client.rpcClient.SendRawTransaction(tx, false)
+	txHash, err := tool.client.indexerClient.SendTransaction(context.Background(), tx)
+	if err != nil {
+		return nil, err
+	}
+
+	hash, err := chainhash.NewHashFromStr(txHash)
+	if err != nil {
+		return nil, err
+	}
+	return hash, nil
 }
 
 func (tool *InscriptionTool) calculateFee() int64 {
