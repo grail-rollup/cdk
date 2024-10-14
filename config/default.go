@@ -30,7 +30,7 @@ IndexerPort = "50001"
 ConsolidationInterval = 60
 ConsolidationTransactionFee = 1000
 UtxoThreshold = 5000
-MinUtxoConsolidationAmount = 5
+MinUtxoConsolidationAmount = 10
 EnableIndexerDebug = false
 
 [Common]
