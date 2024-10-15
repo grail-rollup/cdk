@@ -185,6 +185,12 @@ func createSequenceSender(
 	l1InfoTreeSync *l1infotreesync.L1InfoTreeSync,
 ) *sequencesender.SequenceSender {
 	logger := log.WithFields("module", cdkcommon.SEQUENCE_SENDER)
+
+	// Check config
+	if cfg.SequenceSender.RPCURL == "" {
+		logger.Fatal("Required field RPCURL is empty in sequence sender config")
+	}
+
 	ethman, err := etherman.NewClient(ethermanconfig.Config{
 		EthermanConfig: ethtxman.Config{
 			URL:              cfg.SequenceSender.EthTxManager.Etherman.URL,
@@ -206,9 +212,9 @@ func createSequenceSender(
 		logger.Fatal(err)
 	}
 	cfg.SequenceSender.SenderAddress = auth.From
-	blockFialityType := etherman.BlockNumberFinality(cfg.SequenceSender.BlockFinality)
+	blockFinalityType := etherman.BlockNumberFinality(cfg.SequenceSender.BlockFinality)
 
-	blockFinality, err := blockFialityType.ToBlockNum()
+	blockFinality, err := blockFinalityType.ToBlockNum()
 	if err != nil {
 		logger.Fatalf("Failed to create block finality. Err: %w, ", err)
 	}

@@ -9,7 +9,7 @@ require (
 	github.com/0xPolygon/zkevm-ethtx-manager v0.2.0
 	github.com/0xPolygonHermez/zkevm-data-streamer v0.2.6
 	github.com/0xPolygonHermez/zkevm-node v0.7.3
-	github.com/0xPolygonHermez/zkevm-synchronizer-l1 v1.0.3
+	github.com/0xPolygonHermez/zkevm-synchronizer-l1 v1.0.4
 	github.com/btcsuite/btcd v0.24.2
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/btcsuite/btcd/btcutil v1.1.6
