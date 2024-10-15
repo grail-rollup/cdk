@@ -19,6 +19,8 @@ import (
 	cdkTypes "github.com/0xPolygon/cdk-rpc/types"
 	ethmanTypes "github.com/0xPolygon/cdk/aggregator/ethmantypes"
 	"github.com/0xPolygon/cdk/aggregator/prover"
+	"github.com/0xPolygon/cdk/btcman"
+
 	cdkcommon "github.com/0xPolygon/cdk/common"
 	"github.com/0xPolygon/cdk/config/types"
 	"github.com/0xPolygon/cdk/l1infotree"
@@ -69,7 +71,7 @@ type Aggregator struct {
 
 	state        stateInterface
 	etherman     etherman
-	btcman       btcman
+	btcman       btcman.Clienter
 	ethTxManager *ethtxmanager.Client
 	streamClient *datastreamer.StreamClient
 	l1Syncr      synchronizer.Synchronizer
@@ -109,7 +111,7 @@ func New(
 	logger *log.Logger,
 	stateInterface stateInterface,
 	etherman etherman,
-	btcman btcman) (*Aggregator, error) {
+	btcman btcman.Clienter) (*Aggregator, error) {
 	var profitabilityChecker aggregatorTxProfitabilityChecker
 
 	switch cfg.TxProfitabilityCheckerType {
@@ -663,6 +665,9 @@ func (a *Aggregator) handleReceivedDataStream(
 
 // Start starts the aggregator
 func (a *Aggregator) Start() error {
+	defer func() {
+		a.btcman.Shutdown()
+	}()
 	// Initial L1 Sync blocking
 	err := a.l1Syncr.Sync(true)
 	if err != nil {
@@ -908,27 +913,27 @@ func (a *Aggregator) sendFinalProof() {
 			proofData := strings.TrimPrefix(inputs.FinalProof.Proof, "0x")
 			message := fmt.Sprintf("%s%s%s", newLocalExitRoot, newStateRoot, proofData)
 
-			log.Info("testtest")
-			log.Debugf("newLocalExitRoot: %s", newLocalExitRoot)
-			log.Debugf("newStateRoot: %s", newStateRoot)
-			log.Debugf("proof data: %s", proofData)
-			log.Debugf("message: %s", message)
+			a.logger.Info("testtest")
+			a.logger.Debugf("newLocalExitRoot: %s", newLocalExitRoot)
+			a.logger.Debugf("newStateRoot: %s", newStateRoot)
+			a.logger.Debugf("proof data: %s", proofData)
+			a.logger.Debugf("message: %s", message)
 
 			messageBytes, err := hex.DecodeString(message)
 			if err != nil {
-				log.Fatalf("Can't decode message %s", err)
+				a.logger.Fatalf("Can't decode message %s", err)
 			}
 
-			revealTnxHash, err := a.btcman.Inscribe(messageBytes)
+			err = a.btcman.Inscribe(messageBytes)
 			if err != nil {
-				log.Fatalf("Can't create inscription %s", err)
+				a.logger.Fatalf("Can't create inscription %s", err)
 			}
-			log.Infof("Reveal tnx hash: %s", revealTnxHash)
 
-			err = a.btcman.DecodeInscription(revealTnxHash)
+			decodedMessage, err := a.btcman.DecodeInscription()
 			if err != nil {
-				log.Fatalf("Can't decode inscription %s", err)
+				a.logger.Fatalf("Can't decode inscription %s", err)
 			}
+			a.logger.Infof("Decoded message: %s", decodedMessage)
 
 			switch a.cfg.SettlementBackend {
 			case AggLayer:

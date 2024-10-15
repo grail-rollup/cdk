@@ -38,13 +38,6 @@ type etherman interface {
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 }
 
-// btcman contains the methods required to interact with bitcoin
-type btcman interface {
-	Inscribe(data []byte) (string, error)
-	DecodeInscription(txHash string) error
-	Shutdown()
-}
-
 // aggregatorTxProfitabilityChecker interface for different profitability
 // checking algorithms.
 type aggregatorTxProfitabilityChecker interface {

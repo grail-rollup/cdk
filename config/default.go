@@ -18,13 +18,15 @@ ForkUpgradeNewForkId = 0
 			Url="https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey="
 
 [Btcman]
-Host = "host.docker.internal"
-Port = "8332"
-RpcUser = "regtest"
-RpcPass = "regtest"
-WalletName = "go-wallet"
 PrivateKey = "cSaejkcWwU25jMweWEewRSsrVQq2FGTij1xjXv4x1XvxVRF1ZCr3"
 Net = "regtest"
+IndexerHost = "host.docker.internal"
+IndexerPort = "50001"
+ConsolidationInterval = 60
+ConsolidationTransactionFee = 1000
+UtxoThreshold = 5000
+MinUtxoConsolidationAmount = 10
+EnableIndexerDebug = false
 
 [Common]
 NetworkID = 1

@@ -150,7 +150,7 @@ func createAggregator(ctx context.Context, c config.Config, runMigrations bool) 
 		logger.Fatal(err)
 	}
 
-	btcman, err := btcman.NewClient(c.Btcman)
+	btcman, err := btcman.NewClient(c.Btcman, logger)
 	if err != nil {
 		log.Fatal(err)
 	}

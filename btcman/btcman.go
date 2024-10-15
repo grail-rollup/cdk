@@ -2,55 +2,40 @@ package btcman
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/0xPolygonHermez/zkevm-node/log"
+	"github.com/0xPolygon/cdk/btcman/indexer"
+	"github.com/0xPolygon/cdk/log"
+
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 )
 
+// Client is the btc client that interacts with th btc chain
 type Client struct {
-	BtcClient BtcRpcClienter
-	netParams *chaincfg.Params
-	cfg       Config
-	address   btcutil.Address
+	logger                   *log.Logger
+	keychain                 Keychainer
+	netParams                *chaincfg.Params
+	cfg                      Config
+	address                  *btcutil.Address
+	IndexerClient            indexer.Indexerer
+	consolidationStopChannel chan struct{}
 }
 
-type Clienter interface {
-	Inscribe(data []byte) (string, error)
-	DecodeInscription(txHash string) error
-	Shutdown()
-}
-
-func NewClient(cfg Config) (Clienter, error) {
-	log.Debug("Creating btcman")
-	log.Info("Creating btcman")
+func NewClient(cfg Config, logger *log.Logger) (Clienter, error) {
+	logger.Debug("Creating btcman")
 	isValid := IsValidBtcConfig(&cfg)
 	if !isValid {
-		log.Fatal("Missing required BTC values")
-	}
-
-	// Create the RPC client
-	rpcUrl := fmt.Sprintf("%s:%s/wallet/%s", cfg.Host, cfg.Port, cfg.WalletName)
-	rpcConfig := &rpcclient.ConnConfig{
-		Host:         rpcUrl,
-		User:         cfg.RpcUser,
-		Pass:         cfg.RpcPass,
-		HTTPPostMode: true, // Bitcoin core only supports HTTP POST mode
-		DisableTLS:   true, // Bitcoin core does not provide TLS by default
-	}
-
-	client, err := rpcclient.New(rpcConfig, nil)
-	if err != nil {
-		return nil, err
+		logger.Fatal("Missing required BTC values")
 	}
 
 	// Check if the network is valid
@@ -67,133 +52,143 @@ func NewClient(cfg Config) (Clienter, error) {
 		return nil, err
 	}
 
-	// Derive address from the private key
-	descriptor := fmt.Sprintf("wpkh(%s)", cfg.PrivateKey)
-	descriptorInfo, err := client.GetDescriptorInfo(descriptor)
+	// Get address from the private key
+	address, err := indexer.PrivateKeyToAddress(cfg.PrivateKey, &network)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
-	checksum := descriptorInfo.Checksum
 
-	result, err := client.DeriveAddresses(fmt.Sprintf("%s#%s", descriptor, checksum), nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	address := (*result)[0]
-	decodedAddress, err := btcutil.DecodeAddress(address, &network)
-	if err != nil {
-		log.Fatal(err)
-	}
+	indexer := indexer.NewIndexer(cfg.EnableIndexerDebug, logger)
+	indexer.Start(fmt.Sprintf("%s:%s", cfg.IndexerHost, cfg.IndexerPort))
 
 	// TODO: check if balance > 0?
 
-	return &Client{
-		BtcClient: client,
-		cfg:       cfg,
-		netParams: &network,
-		address:   decodedAddress,
-	}, nil
+	consolidateTxFee := float64(cfg.ConsolidationTransactionFee)
+
+	consolidationInterval := time.Second * time.Duration(cfg.ConsolidationInterval)
+	ticker := time.NewTicker(consolidationInterval)
+	stopChannel := make(chan struct{})
+
+	keychain, err := NewKeychain(cfg.PrivateKey, indexer, &network, logger)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	btcman := Client{
+		logger:                   logger,
+		keychain:                 keychain,
+		cfg:                      cfg,
+		netParams:                &network,
+		address:                  &address,
+		IndexerClient:            indexer,
+		consolidationStopChannel: stopChannel,
+	}
+
+	go func() {
+		for {
+			select {
+			case <-btcman.consolidationStopChannel:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				logger.Debug("Trying to consolidate")
+				utxos, err := btcman.listUnspent()
+				if err != nil {
+					logger.Error(err)
+				}
+
+				btcman.consolidateUTXOS(utxos, consolidateTxFee, cfg.MinUtxoConsolidationAmount)
+			}
+		}
+	}()
+
+	return &btcman, nil
 }
 
 // Shutdown closes the RPC client
 func (client *Client) Shutdown() {
-	client.BtcClient.Shutdown()
+	close(client.consolidationStopChannel)
+	client.IndexerClient.Disconnect()
 }
 
 // getUTXO returns a UTXO spendable by address, consolidates the address utxo set if needed
-func (client *Client) getUTXO(utxoThreshold, consolidateTxFee float64) (*btcjson.ListUnspentResult, error) {
+func (client *Client) getUTXO() (*indexer.UTXO, error) {
 	utxos, err := client.listUnspent()
 	if err != nil {
 		return nil, err
 	}
-
 	if len(utxos) == 0 {
-		return nil, fmt.Errorf("there are no UTXOs for address %s", client.address)
+		return nil, fmt.Errorf("there are no UTXOs")
 	}
-	utxoIndex := 0
+
+	utxoIndex := client.getIndexOfUtxoAboveThreshold(float64(client.cfg.UtxoThreshold), utxos)
+	if utxoIndex == -1 {
+		return nil, fmt.Errorf("can't find utxo to inscribe")
+	}
+
 	utxo := utxos[utxoIndex]
 
-	if utxo.Amount*btcutil.SatoshiPerBitcoin <= utxoThreshold {
-		consolidateTxHash, err := client.consolidateUTXOS(utxos, utxoThreshold, consolidateTxFee, &client.address)
-		if err != nil {
-			return nil, err
-		}
-		if consolidateTxHash != nil {
-			log.Infof("UTXOs consolidated successfully: %s", consolidateTxHash.String())
-
-			utxos, err = client.listUnspent()
-			if err != nil {
-				return nil, err
-			}
-		}
-		utxoIndex = client.getIndexOfUtxoAboveThreshold(utxoThreshold, utxos)
-		if utxoIndex == -1 {
-			return nil, fmt.Errorf("can't find utxo to inscribe")
-		}
-
-		utxo = utxos[utxoIndex]
-	}
-	log.Infof("UTXO for address %s was found", client.address)
-	return &utxo, nil
+	client.logger.Info("UTXO for address was found")
+	return utxo, nil
 }
 
 // consolidateUTXOS combines multiple utxo in one if the utxos are under a specific threshold and over a specific count
-func (client *Client) consolidateUTXOS(utxos []btcjson.ListUnspentResult, threshold, consolidationTxFee float64, address *btcutil.Address) (*chainhash.Hash, error) {
-	minUtxoCount := 10
-	maxUtxoCount := 100
+func (client *Client) consolidateUTXOS(utxos []*indexer.UTXO, consolidationFee float64, minUtxoCountConsolidate int) {
+	if len(utxos) == 0 {
+		client.logger.Info("Address has zero utxos.. skipping consolidation")
+		return
+	}
+
 	var inputs []btcjson.TransactionInput
 	dustAmount := btcutil.Amount(546)
 	totalAmount := btcutil.Amount(0)
-	for _, utxo := range utxos {
-		if len(inputs) == maxUtxoCount {
-			break
-		}
 
-		amount := btcutil.Amount(utxo.Amount * btcutil.SatoshiPerBitcoin)
-		thresholdAmount := btcutil.Amount(threshold)
+	for _, utxo := range utxos {
+		amount := btcutil.Amount(utxo.Value)
+		thresholdAmount := btcutil.Amount(float64(client.cfg.UtxoThreshold))
 		if amount < thresholdAmount && amount > dustAmount {
 			inputs = append(inputs, btcjson.TransactionInput{
-				Txid: utxo.TxID,
-				Vout: utxo.Vout,
+				Txid: utxo.TxHash,
+				Vout: uint32(utxo.TxPos),
 			})
-			log.Infof("Adding utxo %s with amount %d", utxo.TxID, amount)
+			client.logger.Debugf("Adding utxo %s with amount %d", utxo.TxHash, amount)
 			totalAmount += amount
 		}
 	}
 
-	if len(inputs) < minUtxoCount {
-		log.Infof("Not enough UTXOs under the specified amount to consolidate. [%d/%d utoxs under %f]", len(inputs), minUtxoCount, threshold)
-		return nil, nil
+	if len(inputs) < minUtxoCountConsolidate || totalAmount <= btcutil.Amount(consolidationFee) {
+		client.logger.Infof("Not enough UTXOs under the specified amount to consolidate. [%d/%d utoxs under %f]", len(inputs), minUtxoCountConsolidate, float64(client.cfg.UtxoThreshold))
+		return
 	}
 
-	log.Infof("Consolidating %d utxos with total amount %d", len(inputs), totalAmount)
+	client.logger.Infof("Consolidating %d utxos with total amount %d", len(inputs), totalAmount)
 
-	outputs := map[btcutil.Address]btcutil.Amount{
-		*address: totalAmount - btcutil.Amount(consolidationTxFee),
-	}
+	outputAmount := totalAmount - btcutil.Amount(consolidationFee*(float64(len(inputs))*0.1))
 
-	rawTx, err := client.BtcClient.CreateRawTransaction(inputs, outputs, nil)
+	rawTx, err := client.createRawTransaction(inputs, &outputAmount, client.address)
 	if err != nil {
-		log.Fatalf("error creating raw transaction: %v", err)
+		client.logger.Errorf("error creating raw transaction: %v", err)
+		return
 	}
 
-	signedTx, _, err := client.BtcClient.SignRawTransactionWithWallet(rawTx)
+	err = client.keychain.SignTransaction(rawTx, client.IndexerClient)
 	if err != nil {
-		return nil, fmt.Errorf("error signing raw transaction: %v", err)
+		client.logger.Errorf("error signing raw transaction: %v", err)
+		return
 	}
 
-	txHash, err := client.BtcClient.SendRawTransaction(signedTx, false)
+	txHash, err := client.IndexerClient.SendTransaction(context.Background(), rawTx)
 	if err != nil {
-		return nil, fmt.Errorf("error sending transaction: %v", err)
+		client.logger.Errorf("error sending transaction: %v", err)
+		return
 	}
-	return txHash, nil
+	client.logger.Infof("UTXOs consolidated successfully: %s", txHash)
 }
 
 // getUtxoAboveThreshold returns the index of utxo over a specific threshold from a utxo set, if doesn't exist returns -1
-func (client *Client) getIndexOfUtxoAboveThreshold(threshold float64, utxos []btcjson.ListUnspentResult) int {
+func (client *Client) getIndexOfUtxoAboveThreshold(threshold float64, utxos []*indexer.UTXO) int {
 	for index, utxo := range utxos {
-		if utxo.Amount*btcutil.SatoshiPerBitcoin >= float64(threshold) {
-
+		if float64(utxo.Value) >= threshold {
 			return index
 		}
 	}
@@ -201,28 +196,28 @@ func (client *Client) getIndexOfUtxoAboveThreshold(threshold float64, utxos []bt
 }
 
 // createInscriptionRequest cretes the request for the insription with the inscription data
-func (client *Client) createInscriptionRequest(data []byte, utxoThreshold, consolidateTxFee float64) (*InscriptionRequest, error) {
-	utxo, err := client.getUTXO(utxoThreshold, consolidateTxFee)
+func (client *Client) createInscriptionRequest(data []byte) (*InscriptionRequest, error) {
+	utxo, err := client.getUTXO()
 	if err != nil {
-		log.Errorf("Can't find utxo %s", err)
+		client.logger.Errorf("Can't find utxo %s", err)
 		return nil, err
 	}
 
 	commitTxOutPoint := new(wire.OutPoint)
-	inTxid, err := chainhash.NewHashFromStr(utxo.TxID)
+	inTxid, err := chainhash.NewHashFromStr(utxo.TxHash)
 	if err != nil {
-		log.Error("Failed to create inscription request")
+		client.logger.Error("Failed to create inscription request")
 		return nil, err
 	}
 
-	commitTxOutPoint = wire.NewOutPoint(inTxid, utxo.Vout)
+	commitTxOutPoint = wire.NewOutPoint(inTxid, uint32(utxo.TxPos))
 
 	dataList := make([]InscriptionData, 0)
 
 	dataList = append(dataList, InscriptionData{
 		ContentType: "application/octet-stream",
 		Body:        data,
-		Destination: client.address.String(),
+		Destination: (*client.address).String(),
 	})
 
 	request := InscriptionRequest{
@@ -237,95 +232,111 @@ func (client *Client) createInscriptionRequest(data []byte, utxoThreshold, conso
 }
 
 // createInscriptionTool returns a new inscription tool struct
-func (client *Client) createInscriptionTool(message []byte, utxoThreshold, consolidateTxFee float64) (*InscriptionTool, error) {
-	request, err := client.createInscriptionRequest(message, utxoThreshold, consolidateTxFee)
+func (client *Client) createInscriptionTool(message []byte) (*InscriptionTool, error) {
+	request, err := client.createInscriptionRequest(message)
 	if err != nil {
-		log.Errorf("Failed to create inscription request: %s", err)
+		client.logger.Errorf("Failed to create inscription request: %s", err)
 		return nil, err
 	}
 
-	tool, err := NewInscriptionTool(client.netParams, client.BtcClient, request)
+	tool, err := NewInscriptionTool(client.netParams, request, client.IndexerClient, client.keychain)
 	if err != nil {
-		log.Errorf("Failed to create inscription tool: %s", err)
+		client.logger.Errorf("Failed to create inscription tool: %s", err)
 		return nil, err
 	}
 	return tool, nil
 }
 
-func (client *Client) Inscribe(data []byte) (string, error) {
-	// TODO: remove magic numbers
-	utxoThreshold := float64(5000)
-	consolidateTxFee := float64(1000)
-
-	tool, err := client.createInscriptionTool(data, utxoThreshold, consolidateTxFee)
+// Inscribe creates an inscription of data into a btc transaction
+func (client *Client) Inscribe(data []byte) error {
+	tool, err := client.createInscriptionTool(data)
 	if err != nil {
-		log.Errorf("Can't create inscription tool: %s", err)
-		return "", err
+		client.logger.Errorf("Can't create inscription tool: %s", err)
+		return err
 	}
 
 	commitTxHash, revealTxHashList, inscriptions, fees, err := tool.Inscribe()
 	if err != nil {
-		log.Errorf("send tx errr, %v", err)
-		return "", err
+		client.logger.Errorf("send tx err, %v", err)
+		return err
 	}
 	revealTxHash := revealTxHashList[0]
 	inscription := inscriptions[0]
 
-	log.Infof("CommitTxHash: %s", commitTxHash.String())
-	log.Infof("RevealTxHash: %s", revealTxHash.String())
-	log.Infof("Inscription: %s", inscription)
-	log.Infof("Fees: %d", fees)
+	client.logger.Infof("CommitTxHash: %s", commitTxHash.String())
+	client.logger.Infof("RevealTxHash: %s", revealTxHash.String())
+	client.logger.Infof("Inscription: %s", inscription)
+	client.logger.Infof("Fees: %d", fees)
 
-	return revealTxHash.String(), nil
+	return nil
 }
 
-// DecodeInscription reads the inscribed message from a BTC by a transaction hash
-func (client *Client) DecodeInscription(txHash string) error {
-	tx, err := client.getTransaction(txHash)
+// DecodeInscription reads the inscribed message from BTC by a transaction hash
+func (client *Client) DecodeInscription() (string, error) {
+	height, err := client.getBlockchainHeigth()
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	revealTx, err := client.IndexerClient.
+		GetLastInscribedTransactionByPublicKey(context.Background(), client.keychain.GetPublicKey(), height, float64(client.cfg.UtxoThreshold))
+	if err != nil {
+		switch err.(type) {
+		case indexer.NoInscription:
+			log.Warn(err)
+			return err.Error(), nil
+		default:
+			log.Error(err)
+		}
+		return "", err
+	}
+
+	tx, err := client.getTransaction(revealTx.TxHash)
+	if err != nil {
+		return "", err
 	}
 	inscriptionMessage, err := client.getInscriptionMessage(tx.Hex)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	disasm, err := txscript.DisasmString(inscriptionMessage)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	proof := strings.ReplaceAll(disasm, " ", "")
-	log.Infof("Decoded Message: %s", proof)
-	return nil
+
+	return proof, nil
 }
 
 // getTransaction returns a transaction from BTC by a transaction hash
 func (client *Client) getTransaction(txid string) (*btcjson.GetTransactionResult, error) {
-	hash, err := chainhash.NewHashFromStr(txid)
+	indexerResponse, err := client.IndexerClient.GetTransaction(context.Background(), txid, false)
 	if err != nil {
 		return nil, err
 	}
-
-	return client.BtcClient.GetTransaction(hash)
+	return &btcjson.GetTransactionResult{
+		Hex: indexerResponse.Hex,
+	}, nil
 }
 
 // getInscriptionMessage returns the raw inscribed message from the transaction
 func (client *Client) getInscriptionMessage(txHex string) ([]byte, error) {
 	txBytes, err := hex.DecodeString(txHex)
 	if err != nil {
-		log.Errorf("Error decoding hex string: %s", err)
+		client.logger.Errorf("Error decoding hex string: %s", err)
 		return nil, err
 	}
 	var targetTx wire.MsgTx
 
 	err = targetTx.Deserialize(bytes.NewReader(txBytes))
 	if err != nil {
-		log.Infof("Error deserializing transaction: %s", err)
+		client.logger.Infof("Error deserializing transaction: %s", err)
 		return nil, err
 	}
 	if len(targetTx.TxIn) < 1 || len(targetTx.TxIn[0].Witness) < 2 {
-		log.Infof("Error getting witness data: %s\n", err)
+		client.logger.Infof("Error getting witness data: %s\n", err)
 		return nil, err
 	}
 	inscriptionHex := hex.EncodeToString(targetTx.TxIn[0].Witness[1])
@@ -345,14 +356,67 @@ func (client *Client) getInscriptionMessage(txHex string) ([]byte, error) {
 	messageHex := inscriptionHex[messageIndex : len(inscriptionHex)-2]
 	decodedBytes, err := hex.DecodeString(messageHex)
 	if err != nil {
-		log.Errorf("Error decoding hex string: %s", err)
+		client.logger.Errorf("Error decoding hex string: %s", err)
 		return nil, err
 	}
 	return decodedBytes, nil
 }
 
+// getBlockchainHeigth returns the current height of the btc blockchain
+func (client *Client) getBlockchainHeigth() (int32, error) {
+	blockChainInfo, err := client.IndexerClient.GetBlockchainInfo(context.Background())
+	if err != nil {
+		return -1, err
+	}
+	return blockChainInfo.Height, nil
+}
+
 // TODO: when called, check if len is > 0
 // listUnspent returns a list of unsent utxos filtered by address
-func (client *Client) listUnspent() ([]btcjson.ListUnspentResult, error) {
-	return client.BtcClient.ListUnspentMinMaxAddresses(0, 999999, []btcutil.Address{client.address})
+func (client *Client) listUnspent() ([]*indexer.UTXO, error) {
+	indexerResponse, err := client.IndexerClient.ListUnspent(context.Background(), client.keychain.GetPublicKey())
+	if err != nil {
+		return nil, err
+	}
+	blockchainHeight, err := client.getBlockchainHeigth()
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO change and move to config when no longer using coinbase transactions for testing
+	requiredCoinbaseConfirmations := int32(100)
+	utxos := []*indexer.UTXO{}
+	for _, r := range indexerResponse {
+		// blockchain height - transacton block height + 1 in order to count the block of the transaction
+		confirmations := blockchainHeight - int32(r.Height) + 1
+		if confirmations > requiredCoinbaseConfirmations {
+			utxos = append(utxos, r)
+
+		}
+	}
+
+	return utxos, nil
+}
+
+// createRawTransaction returns an unsigned transaction
+func (client *Client) createRawTransaction(inputs []btcjson.TransactionInput, outputAmount *btcutil.Amount, outputAddress *btcutil.Address) (*wire.MsgTx, error) {
+	tx := wire.NewMsgTx(wire.TxVersion)
+
+	for _, input := range inputs {
+		hash, err := chainhash.NewHashFromStr(input.Txid)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing txid: %v", err)
+		}
+
+		outputIndex := input.Vout
+		txIn := wire.NewTxIn(wire.NewOutPoint(hash, uint32(outputIndex)), nil, nil)
+		tx.AddTxIn(txIn)
+	}
+	pubKeyHash := (*outputAddress).ScriptAddress()
+	witnessProgram := append([]byte{0x00, 0x14}, pubKeyHash...)
+
+	txOut := wire.NewTxOut(int64(*outputAmount), witnessProgram)
+	tx.AddTxOut(txOut)
+
+	return tx, nil
 }
