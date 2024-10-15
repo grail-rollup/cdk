@@ -17,6 +17,7 @@ import (
 
 	"github.com/0xPolygon/cdk-rpc/rpc"
 	cdkTypes "github.com/0xPolygon/cdk-rpc/types"
+	"github.com/0xPolygon/cdk/aggregator/agglayer"
 	ethmanTypes "github.com/0xPolygon/cdk/aggregator/ethmantypes"
 	"github.com/0xPolygon/cdk/aggregator/prover"
 	"github.com/0xPolygon/cdk/btcman"
@@ -69,11 +70,11 @@ type Aggregator struct {
 	cfg    Config
 	logger *log.Logger
 
-	state        stateInterface
-	etherman     etherman
+	state        StateInterface
+	etherman     Etherman
 	btcman       btcman.Clienter
-	ethTxManager *ethtxmanager.Client
-	streamClient *datastreamer.StreamClient
+	ethTxManager EthTxManagerClient
+	streamClient StreamClient
 	l1Syncr      synchronizer.Synchronizer
 	halted       atomic.Bool
 
@@ -101,7 +102,7 @@ type Aggregator struct {
 	exit context.CancelFunc
 
 	sequencerPrivateKey *ecdsa.PrivateKey
-	aggLayerClient      AgglayerClientInterface
+	aggLayerClient      agglayer.AgglayerClientInterface
 }
 
 // New creates a new aggregator.
@@ -109,8 +110,8 @@ func New(
 	ctx context.Context,
 	cfg Config,
 	logger *log.Logger,
-	stateInterface stateInterface,
-	etherman etherman,
+	stateInterface StateInterface,
+	etherman Etherman,
 	btcman btcman.Clienter) (*Aggregator, error) {
 	var profitabilityChecker aggregatorTxProfitabilityChecker
 
@@ -172,12 +173,12 @@ func New(
 	}
 
 	var (
-		aggLayerClient      AgglayerClientInterface
+		aggLayerClient      agglayer.AgglayerClientInterface
 		sequencerPrivateKey *ecdsa.PrivateKey
 	)
 
 	if !cfg.SyncModeOnlyEnabled && cfg.SettlementBackend == AggLayer {
-		aggLayerClient = NewAggLayerClient(cfg.AggLayerURL)
+		aggLayerClient = agglayer.NewAggLayerClient(cfg.AggLayerURL)
 
 		sequencerPrivateKey, err = newKeyFromKeystore(cfg.SequencerPrivateKey)
 		if err != nil {
@@ -958,10 +959,11 @@ func (a *Aggregator) settleWithAggLayer(
 	inputs ethmanTypes.FinalProofInputs) bool {
 	proofStrNo0x := strings.TrimPrefix(inputs.FinalProof.Proof, "0x")
 	proofBytes := common.Hex2Bytes(proofStrNo0x)
-	tx := Tx{
+
+	tx := agglayer.Tx{
 		LastVerifiedBatch: cdkTypes.ArgUint64(proof.BatchNumber - 1),
 		NewVerifiedBatch:  cdkTypes.ArgUint64(proof.BatchNumberFinal),
-		ZKP: ZKP{
+		ZKP: agglayer.ZKP{
 			NewStateRoot:     common.BytesToHash(inputs.NewStateRoot),
 			NewLocalExitRoot: common.BytesToHash(inputs.NewLocalExitRoot),
 			Proof:            cdkTypes.ArgBytes(proofBytes),
@@ -980,9 +982,12 @@ func (a *Aggregator) settleWithAggLayer(
 	a.logger.Debug("final proof signedTx: ", signedTx.Tx.ZKP.Proof.Hex())
 	txHash, err := a.aggLayerClient.SendTx(*signedTx)
 	if err != nil {
-		a.logger.Errorf("failed to send tx to the agglayer: %v", err)
+		if errors.Is(err, agglayer.ErrAgglayerRateLimitExceeded) {
+			a.logger.Errorf("%s. Config param VerifyProofInterval should match the agglayer configured rate limit.", err)
+		} else {
+			a.logger.Errorf("failed to send tx to the agglayer: %v", err)
+		}
 		a.handleFailureToAddVerifyBatchToBeMonitored(ctx, proof)
-
 		return false
 	}
 
@@ -1050,7 +1055,7 @@ func (a *Aggregator) handleFailureToAddVerifyBatchToBeMonitored(ctx context.Cont
 
 // buildFinalProof builds and return the final proof for an aggregated/batch proof.
 func (a *Aggregator) buildFinalProof(
-	ctx context.Context, prover proverInterface, proof *state.Proof) (*prover.FinalProof, error) {
+	ctx context.Context, prover ProverInterface, proof *state.Proof) (*prover.FinalProof, error) {
 	tmpLogger := a.logger.WithFields(
 		"prover", prover.Name(),
 		"proverId", prover.ID(),
@@ -1096,7 +1101,7 @@ func (a *Aggregator) buildFinalProof(
 // build the final proof.  If no proof is provided it looks for a previously
 // generated proof.  If the proof is eligible, then the final proof generation
 // is triggered.
-func (a *Aggregator) tryBuildFinalProof(ctx context.Context, prover proverInterface, proof *state.Proof) (bool, error) {
+func (a *Aggregator) tryBuildFinalProof(ctx context.Context, prover ProverInterface, proof *state.Proof) (bool, error) {
 	proverName := prover.Name()
 	proverID := prover.ID()
 
@@ -1282,7 +1287,7 @@ func (a *Aggregator) unlockProofsToAggregate(ctx context.Context, proof1 *state.
 }
 
 func (a *Aggregator) getAndLockProofsToAggregate(
-	ctx context.Context, prover proverInterface) (*state.Proof, *state.Proof, error) {
+	ctx context.Context, prover ProverInterface) (*state.Proof, *state.Proof, error) {
 	tmpLogger := a.logger.WithFields(
 		"prover", prover.Name(),
 		"proverId", prover.ID(),
@@ -1330,7 +1335,7 @@ func (a *Aggregator) getAndLockProofsToAggregate(
 	return proof1, proof2, nil
 }
 
-func (a *Aggregator) tryAggregateProofs(ctx context.Context, prover proverInterface) (bool, error) {
+func (a *Aggregator) tryAggregateProofs(ctx context.Context, prover ProverInterface) (bool, error) {
 	proverName := prover.Name()
 	proverID := prover.ID()
 
@@ -1495,7 +1500,7 @@ func (a *Aggregator) getVerifiedBatchAccInputHash(ctx context.Context, batchNumb
 }
 
 func (a *Aggregator) getAndLockBatchToProve(
-	ctx context.Context, prover proverInterface,
+	ctx context.Context, prover ProverInterface,
 ) (*state.Batch, []byte, *state.Proof, error) {
 	proverID := prover.ID()
 	proverName := prover.Name()
@@ -1611,7 +1616,7 @@ func (a *Aggregator) getAndLockBatchToProve(
 	return &dbBatch.Batch, dbBatch.Witness, proof, nil
 }
 
-func (a *Aggregator) tryGenerateBatchProof(ctx context.Context, prover proverInterface) (bool, error) {
+func (a *Aggregator) tryGenerateBatchProof(ctx context.Context, prover ProverInterface) (bool, error) {
 	tmpLogger := a.logger.WithFields(
 		"prover", prover.Name(),
 		"proverId", prover.ID(),
